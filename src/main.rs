@@ -68,6 +68,10 @@ fn start_up(mut commands: Commands, ui_state: ResMut<UiState>, mut images: ResMu
     commands
         .spawn(SpriteBundle {
             texture: image_handle,
+            sprite: Sprite {
+                custom_size: Some(Vec2::new(500.0, 500.0)),
+                ..Default::default()
+            },
             ..Default::default()
         })
         .insert(video_player);
