@@ -7,22 +7,31 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use bevy::prelude::Entity;
 use byteorder::{ByteOrder, LittleEndian};
 use gst::{element_error, prelude::*};
 use gstreamer_video::VideoFrameExt;
 use rodio::OutputStream;
 
+use crate::plugin::RateId;
+
 pub struct VideoInfo {
     pub height: u32,
     pub width: u32,
     pub data: Vec<u8>,
+    pub id: Entity,
 }
-pub fn create_pipeline(ls: Arc<Mutex<VecDeque<VideoInfo>>>, video_rate: Arc<Mutex<f64>>) {
+pub fn create_pipeline(
+    uri: &str,
+    ls: Arc<Mutex<VecDeque<VideoInfo>>>,
+    id: Entity,
+    rate_info: Arc<Mutex<Vec<RateId>>>,
+) {
     let (_stream, stream_handle) = OutputStream::try_default().expect("Error");
     let player_audio = rodio::Sink::try_new(&stream_handle).expect("Error");
 
     gst::init().unwrap();
-    let uri = "https://gstreamer.freedesktop.org/data/media/sintel_trailer-480p.webm";
+
     let pipeline = gst::parse::launch(&format!(
         "uridecodebin uri={uri} name=decodebin ! videoconvert ! appsink name=video_sink \
  decodebin. ! audioconvert ! appsink name=audio_sink"
@@ -76,6 +85,7 @@ pub fn create_pipeline(ls: Arc<Mutex<VecDeque<VideoInfo>>>, video_rate: Arc<Mute
                     width: frame.width(),
                     height: frame.height(),
                     data: pixel_data.to_vec(),
+                    id: id,
                 };
                 if loading_tag {
                     ls.lock().unwrap().push_back(video_info);
@@ -152,9 +162,11 @@ pub fn create_pipeline(ls: Arc<Mutex<VecDeque<VideoInfo>>>, video_rate: Arc<Mute
                     if let Some(duration) = pipeline.query_duration::<gst::ClockTime>() {
                         if let Some(clock) = pipeline.clock() {
                             if let Some(rate) = clock.control_rate() {
-                                let mut tmp_rate = video_rate.lock().unwrap();
-                                *tmp_rate = duration.seconds_f64() / rate.seconds_f64();
-                                drop(tmp_rate);
+                                let tmp_rate = duration.seconds_f64() / rate.seconds_f64();
+                                rate_info.lock().unwrap().push(RateId {
+                                    id: id,
+                                    rate: tmp_rate,
+                                });
                             }
                         }
                     }
