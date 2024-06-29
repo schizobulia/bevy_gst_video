@@ -4,45 +4,42 @@ use bevy::{
 };
 use image::DynamicImage;
 use std::{
-    collections::VecDeque, sync::{Arc, Mutex}, thread, time::Duration
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+    thread,
+    time::Duration,
 };
 
-use crate::video::{self, VideoInfo};
+use crate::video::{GstPlayer, VideoInfo};
 
 pub struct RateId {
     pub rate: f64,
     pub id: Entity,
 }
 
-struct VideoTask {
-    uri: String,
-    frames: Arc<Mutex<VecDeque<VideoInfo>>>,
-    rate: Arc<Mutex<Vec<RateId>>>,
-    id: Entity
-}
-
 #[derive(Resource)]
 pub struct VideoPlayerState {
     pub frames: Arc<Mutex<VecDeque<VideoInfo>>>,
     pub rate: Arc<Mutex<Vec<RateId>>>,
-    pub tasks: Vec<VideoTask>,
 }
 
+#[derive(Debug, Clone, Copy)]
 pub enum VideoState {
     Playing,
     Paused,
-    Stopped,
     Start,
-    NONE,
+    Ready,
+    Init,
 }
 
+#[derive(Debug, Clone)]
 pub struct FrameData {
     data: Vec<u8>,
     height: u32,
     width: u32,
 }
 
-#[derive(Component)]
+#[derive(Component, Clone)]
 pub struct VideoPlayer {
     pub state: VideoState,
     pub timer: Timer,
@@ -51,6 +48,7 @@ pub struct VideoPlayer {
     pub width: f32,
     pub height: f32,
     pub uri: String,
+    pub pipeline: Option<GstPlayer>,
 }
 
 pub struct VideoPlugin;
@@ -60,7 +58,6 @@ impl Plugin for VideoPlugin {
         app.insert_resource(VideoPlayerState {
             frames: Arc::new(Mutex::new(VecDeque::new())),
             rate: Arc::new(Mutex::new(Vec::new())),
-            tasks: Vec::new(),
         });
     }
 }
@@ -90,17 +87,11 @@ pub fn add_video_frame(mut query: Query<&mut VideoPlayer>, video_state: ResMut<V
 }
 
 pub fn render_video_frame(
-    mut query: Query<(&mut VideoPlayer, &mut Handle<Image>)>,
+    mut query: Query<(&mut VideoPlayer, &mut UiImage)>,
     mut images: ResMut<Assets<Image>>,
     time: Res<Time>,
-    mut video_state: ResMut<VideoPlayerState>,
+    video_state: ResMut<VideoPlayerState>,
 ) {
-    let task_item = video_state.tasks.pop();
-    if let Some(task) = task_item {
-        thread::spawn(move || {
-            video::create_pipeline(task.uri.as_str(), task.frames, task.id, task.rate);
-        });
-    }
     for (mut video_player, mut image_handle) in query.iter_mut() {
         match video_player.state {
             VideoState::Playing => {
@@ -114,22 +105,33 @@ pub fn render_video_frame(
                             true,
                             RenderAssetUsages::default(),
                         );
-                        let new_image_handle = images.add(canvas);
-                        *image_handle = new_image_handle;
+                        image_handle.texture = images.add(canvas);
                     }
                 }
             }
-            VideoState::Start => {
+            VideoState::Init => {
                 let frame_state_clone = Arc::clone(&video_state.frames);
                 let rate_state_clone = Arc::clone(&video_state.rate);
                 if let Some(id) = video_player.id {
-                    video_state.tasks.push(VideoTask {
-                        uri: video_player.uri.clone(),
-                        frames: frame_state_clone,
-                        rate: rate_state_clone,
-                        id,
+                    video_player.state = VideoState::Ready;
+                    let pipeline = GstPlayer::new(video_player.uri.as_str());
+                    let pipeline_clone = Arc::new(Mutex::new(pipeline.clone()));
+                    thread::spawn(move || {
+                        pipeline_clone.lock().unwrap().start(
+                            frame_state_clone,
+                            id,
+                            rate_state_clone,
+                        );
                     });
+                    video_player.pipeline = Some(pipeline);
                 }
+            }
+            VideoState::Start => {
+                video_player.state = VideoState::Playing;
+                video_player.pipeline.clone().unwrap().play();
+            }
+            VideoState::Paused => {
+                video_player.pipeline.clone().unwrap().pause();
             }
             _ => {}
         }
@@ -139,7 +141,7 @@ pub fn render_video_frame(
 pub fn insert_video_component(
     mut images: ResMut<Assets<Image>>,
     default_size: Vec2,
-) -> SpriteBundle {
+) -> ImageBundle {
     let mut canvas = Image::from_dynamic(
         DynamicImage::new_rgb8(500, 500),
         true,
@@ -151,10 +153,14 @@ pub fn insert_video_component(
         ..default()
     });
     let image_handle = images.add(canvas);
-    SpriteBundle {
-        texture: image_handle,
-        sprite: Sprite {
-            custom_size: Some(default_size),
+    ImageBundle {
+        image: UiImage {
+            texture: image_handle,
+            ..Default::default()
+        },
+        style: Style {
+            width: Val::Px(default_size.x),
+            height: Val::Px(default_size.y),
             ..Default::default()
         },
         ..Default::default()

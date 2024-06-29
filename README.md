@@ -1,3 +1,6 @@
+## bevy_gst_video
+
+```rust
 use std::collections::VecDeque;
 
 use bevy::prelude::*;
@@ -100,3 +103,4 @@ fn update(
         }
     }
 }
+```
