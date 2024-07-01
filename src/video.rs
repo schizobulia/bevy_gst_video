@@ -7,38 +7,44 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use bevy::prelude::Entity;
 use byteorder::{ByteOrder, LittleEndian};
 use gst::{element_error, prelude::*};
 use gstreamer_video::VideoFrameExt;
 use rodio::OutputStream;
 
-use crate::plugin::RateId;
-
 pub struct VideoInfo {
     pub height: u32,
     pub width: u32,
     pub data: Vec<u8>,
-    pub id: Entity,
+    pub pts: u64,
 }
 
-#[derive(Debug, Clone)]
+
+#[derive(Clone)]
 pub struct GstPlayer {
     pipeline: gst::Pipeline,
+    pub frame: Arc<Mutex<VecDeque<VideoInfo>>>,
+    pub previous_pts: Arc<Mutex<u64>>,
+    pub duration: u64,
 }
 
 impl GstPlayer {
     pub fn new(uri: &str) -> Self {
         gst::init().unwrap();
-
         let pipeline = gst::parse::launch(&format!(
-            "uridecodebin uri={uri} name=decodebin ! videoconvert ! appsink name=video_sink \
-     decodebin. ! audioconvert ! appsink name=audio_sink"
+            "uridecodebin uri={uri} name=decodebin ! \
+            videoconvert ! appsink name=video_sink \
+            decodebin. ! audioconvert ! appsink name=audio_sink"
         ))
         .unwrap()
         .downcast::<gst::Pipeline>()
         .expect("Expected a gst::Pipeline");
-        GstPlayer { pipeline: pipeline }
+        GstPlayer {
+            pipeline: pipeline,
+            frame: Arc::new(Mutex::new(VecDeque::new())),
+            duration: 0,
+            previous_pts: Arc::new(Mutex::new(0)),
+        }
     }
 
     pub fn play(&self) {
@@ -48,15 +54,10 @@ impl GstPlayer {
     pub fn pause(&self) {
         self.pipeline.set_state(gst::State::Paused).unwrap();
     }
-
-    pub fn start(
-        &self,
-        ls: Arc<Mutex<VecDeque<VideoInfo>>>,
-        id: Entity,
-        rate_info: Arc<Mutex<Vec<RateId>>>,
-    ) {
+    pub fn start(&mut self) {
         let (_stream, stream_handle) = OutputStream::try_default().expect("Error");
-        let player_audio = rodio::Sink::try_new(&stream_handle).expect("Error");
+        let ps = rodio::Sink::try_new(&stream_handle).expect("Error");
+
         let appsink = self
             .pipeline
             .by_name("video_sink")
@@ -72,8 +73,7 @@ impl GstPlayer {
         ));
         appsink.set_max_buffers(100);
         self.pipeline.set_state(gst::State::Paused).unwrap();
-        let mut tmp_list = VecDeque::new();
-        let mut loading_tag = false;
+        let self_frame = Arc::clone(&self.frame);
         appsink.set_callbacks(
             gst_app::AppSinkCallbacks::builder()
                 .new_sample(move |appsink| {
@@ -86,7 +86,6 @@ impl GstPlayer {
                         );
                         gst::FlowError::Error
                     })?;
-
                     let caps = sample.caps().expect("Sample without caps");
                     let info = gst_video::VideoInfo::from_caps(caps).expect("Failed to parse caps");
                     let frame = gst_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info)
@@ -104,18 +103,9 @@ impl GstPlayer {
                         width: frame.width(),
                         height: frame.height(),
                         data: pixel_data.to_vec(),
-                        id: id,
+                        pts: buffer.pts().unwrap().nseconds(),
                     };
-                    if loading_tag {
-                        ls.lock().unwrap().push_back(video_info);
-                    } else {
-                        tmp_list.push_back(video_info);
-                        if tmp_list.len() > 20 {
-                            ls.lock().unwrap().append(&mut tmp_list);
-                            tmp_list.clear();
-                            loading_tag = true;
-                        }
-                    }
+                    self_frame.lock().unwrap().push_back(video_info);
                     Ok(gst::FlowSuccess::Ok)
                 })
                 .build(),
@@ -127,7 +117,11 @@ impl GstPlayer {
             .downcast::<gst_app::AppSink>()
             .expect("Audio sink element is expected to be an appsink!");
         let bus = self.pipeline.bus().unwrap();
-
+        audio_sink.set_caps(Some(
+            &gst_audio::AudioCapsBuilder::new()
+                .format(gst_audio::AudioFormat::F32le)
+                .build(),
+        ));
         audio_sink.set_callbacks(
             gst_app::AppSinkCallbacks::builder()
                 .new_sample(move |audio_sink| {
@@ -146,6 +140,7 @@ impl GstPlayer {
                             gst::FlowError::Error
                         })
                         .expect("Error");
+
                     let caps = sample.caps().expect("Sample without caps");
                     let info = gst_audio::AudioInfo::from_caps(caps).expect("Failed to parse caps");
                     let map: gstreamer::BufferMap<gstreamer::buffer::Readable> =
@@ -155,18 +150,15 @@ impl GstPlayer {
                                 gst::ResourceError::Failed,
                                 ("Failed to map buffer readable")
                             );
-
                             gst::FlowError::Error
                         })?;
                     let u8_data: &[u8] = map.as_slice();
                     let mut f32_data = vec![0f32; u8_data.len() / 4];
                     LittleEndian::read_f32_into(u8_data, &mut f32_data);
-
                     let ch = info.channels() as u16;
                     let rate = info.rate();
                     let s = rodio::buffer::SamplesBuffer::new(ch, rate, f32_data);
-                    player_audio.append(s);
-
+                    ps.append(s);
                     Ok(gst::FlowSuccess::Ok)
                 })
                 .build(),
@@ -181,23 +173,15 @@ impl GstPlayer {
                         .unwrap_or(false)
                         && state_changed.current() == gst::State::Playing
                     {
-                        if let Some(duration) = self.pipeline.query_duration::<gst::ClockTime>() {
-                            if let Some(clock) = self.pipeline.clock() {
-                                if let Some(rate) = clock.control_rate() {
-                                    let tmp_rate = duration.seconds_f64() / rate.seconds_f64();
-                                    rate_info.lock().unwrap().push(RateId {
-                                        id: id,
-                                        rate: tmp_rate,
-                                    });
-                                }
-                            }
-                        }
                     } else if state_changed
                         .src()
                         .map(|s| s == &self.pipeline)
                         .unwrap_or(false)
                         && state_changed.current() == gst::State::Paused
                     {
+                        if let Some(duration) = self.pipeline.query_duration::<gst::ClockTime>() {
+                            self.duration = duration.mseconds();
+                        }
                     }
                 }
                 MessageView::Eos(..) => {

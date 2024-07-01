@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
 use bevy::prelude::*;
 use plugin::{insert_video_component, VideoPlayer, VideoState};
@@ -9,10 +9,7 @@ fn main() {
     App::new()
         .add_plugins((DefaultPlugins, plugin::VideoPlugin))
         .add_systems(Startup, start_up)
-        .add_systems(
-            Update,
-            (update, plugin::add_video_frame, plugin::render_video_frame),
-        )
+        .add_systems(Update, (update, plugin::render_video_frame))
         .run();
 }
 
@@ -22,8 +19,7 @@ fn start_up(mut commands: Commands, images: ResMut<Assets<Image>>, asset_server:
     let video_player = VideoPlayer {
         uri: uri.to_string(),
         state: VideoState::Init,
-        timer: Timer::from_seconds(0.1, TimerMode::Repeating),
-        data: VecDeque::new(),
+        timer: Arc::new(Mutex::new(Timer::from_seconds(1.0, TimerMode::Repeating))),
         width: 500.0,
         height: 500.0,
         id: None,
