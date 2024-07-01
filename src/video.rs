@@ -19,7 +19,6 @@ pub struct VideoInfo {
     pub pts: u64,
 }
 
-
 #[derive(Clone)]
 pub struct GstPlayer {
     pipeline: gst::Pipeline,
@@ -30,13 +29,13 @@ pub struct GstPlayer {
 
 impl GstPlayer {
     pub fn new(uri: &str) -> Self {
-        gst::init().unwrap();
+        gst::init().expect("Failed to initialize gstreamer");
         let pipeline = gst::parse::launch(&format!(
             "uridecodebin uri={uri} name=decodebin ! \
             videoconvert ! appsink name=video_sink \
             decodebin. ! audioconvert ! appsink name=audio_sink"
         ))
-        .unwrap()
+        .expect("Failed to create pipeline")
         .downcast::<gst::Pipeline>()
         .expect("Expected a gst::Pipeline");
         GstPlayer {
@@ -48,11 +47,20 @@ impl GstPlayer {
     }
 
     pub fn play(&self) {
-        self.pipeline.set_state(gst::State::Playing).unwrap();
+        self.pipeline
+            .set_state(gst::State::Playing)
+            .expect("play error");
     }
 
     pub fn pause(&self) {
-        self.pipeline.set_state(gst::State::Paused).unwrap();
+        self.pipeline
+            .set_state(gst::State::Paused)
+            .expect("pause error");
+    }
+    pub fn destroy(&self) {
+        self.pipeline
+            .set_state(gst::State::Null)
+            .expect("destroy error");
     }
     pub fn start(&mut self) {
         let (_stream, stream_handle) = OutputStream::try_default().expect("Error");
@@ -72,7 +80,9 @@ impl GstPlayer {
                 .build(),
         ));
         appsink.set_max_buffers(100);
-        self.pipeline.set_state(gst::State::Paused).unwrap();
+        self.pipeline
+            .set_state(gst::State::Paused)
+            .expect("paused error");
         let self_frame = Arc::clone(&self.frame);
         appsink.set_callbacks(
             gst_app::AppSinkCallbacks::builder()
@@ -98,14 +108,17 @@ impl GstPlayer {
 
                         gst::FlowError::Error
                     })?;
-                    let pixel_data = frame.plane_data(0).unwrap();
+                    let pixel_data = frame.plane_data(0).expect("Failed to get pixel data");
                     let video_info = VideoInfo {
                         width: frame.width(),
                         height: frame.height(),
                         data: pixel_data.to_vec(),
-                        pts: buffer.pts().unwrap().nseconds(),
+                        pts: buffer.pts().expect("pts error").nseconds(),
                     };
-                    self_frame.lock().unwrap().push_back(video_info);
+                    self_frame
+                        .lock()
+                        .expect("self_frame error")
+                        .push_back(video_info);
                     Ok(gst::FlowSuccess::Ok)
                 })
                 .build(),
@@ -116,7 +129,7 @@ impl GstPlayer {
             .expect("Audio sink element not found")
             .downcast::<gst_app::AppSink>()
             .expect("Audio sink element is expected to be an appsink!");
-        let bus = self.pipeline.bus().unwrap();
+        let bus = self.pipeline.bus().expect("Pipeline without bus");
         audio_sink.set_caps(Some(
             &gst_audio::AudioCapsBuilder::new()
                 .format(gst_audio::AudioFormat::F32le)

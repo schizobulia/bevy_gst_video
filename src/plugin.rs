@@ -13,11 +13,13 @@ use crate::video::GstPlayer;
 
 #[derive(Debug, Clone, Copy)]
 pub enum VideoState {
+    Init,
     Playing,
     Paused,
     Start,
     Ready,
-    Init,
+    #[allow(dead_code)]
+    Stop,
 }
 
 #[derive(Component, Clone)]
@@ -36,6 +38,51 @@ pub struct VideoPlugin;
 impl Plugin for VideoPlugin {
     fn build(&self, _: &mut App) {}
 }
+
+fn handle_playing_state(
+    video_player: &mut VideoPlayer,
+    image_handle: &mut UiImage,
+    images: &mut Assets<Image>,
+    time: &Res<Time>,
+) {
+    if let Ok(mut player_time) = video_player.timer.lock() {
+        if player_time.tick(time.delta()).just_finished() {
+            if let Some(ref_pipeline) = video_player.pipeline.as_ref() {
+                if let Ok(mut frames) = ref_pipeline.frame.lock() {
+                    if let Some(data) = frames.pop_front() {
+                        if let Some(rbg_data) =
+                            image::RgbaImage::from_raw(data.width, data.height, data.data)
+                        {
+                            let canvas = Image::from_dynamic(
+                                DynamicImage::ImageRgba8(rbg_data),
+                                true,
+                                RenderAssetUsages::default(),
+                            );
+                            image_handle.texture = images.add(canvas);
+                            if let Ok(mut pts) = ref_pipeline.previous_pts.lock() {
+                                let dt = (data.pts - *pts) / 1_000_000;
+                                player_time.set_duration(Duration::from_millis(dt));
+                                *pts = data.pts;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn initialize_video_player(video_player: &mut VideoPlayer) {
+    let pipeline = GstPlayer::new(video_player.uri.as_str());
+    let pipeline_clone = Arc::new(Mutex::new(pipeline.clone()));
+    thread::spawn(move || {
+        if let Ok(mut pipeline) = pipeline_clone.lock() {
+            pipeline.start();
+        }
+    });
+    video_player.pipeline = Some(pipeline);
+}
+
 pub fn render_video_frame(
     mut query: Query<(&mut VideoPlayer, &mut UiImage)>,
     mut images: ResMut<Assets<Image>>,
@@ -44,44 +91,29 @@ pub fn render_video_frame(
     for (mut video_player, mut image_handle) in query.iter_mut() {
         match video_player.state {
             VideoState::Playing => {
-                let mut player_timer = video_player.timer.lock().unwrap();
-                if player_timer.tick(time.delta()).just_finished() {
-                    let ref_pipeline = video_player.pipeline.as_ref().unwrap();
-                    let mut frames = ref_pipeline.frame.lock().unwrap();
-                    if let Some(data) = frames.pop_front() {
-                        let canvas = Image::from_dynamic(
-                            DynamicImage::ImageRgba8(
-                                image::RgbaImage::from_raw(data.width, data.height, data.data)
-                                    .unwrap(),
-                            ),
-                            true,
-                            RenderAssetUsages::default(),
-                        );
-                        image_handle.texture = images.add(canvas);
-                        let p_pts = *ref_pipeline.previous_pts.lock().unwrap();
-                        let dt = (data.pts - p_pts) / 1_000_000;
-                        player_timer.set_duration(Duration::from_millis(dt));
-                        *ref_pipeline.previous_pts.lock().unwrap() = data.pts;
-                    }
-                }
+                handle_playing_state(&mut video_player, &mut image_handle, &mut images, &time)
             }
             VideoState::Init => {
-                if let Some(_) = video_player.id {
+                if video_player.id.is_some() {
                     video_player.state = VideoState::Ready;
-                    let pipeline = GstPlayer::new(video_player.uri.as_str());
-                    let pipeline_clone = Arc::new(Mutex::new(pipeline.clone()));
-                    thread::spawn(move || {
-                        pipeline_clone.lock().unwrap().start();
-                    });
-                    video_player.pipeline = Some(pipeline);
+                    initialize_video_player(&mut video_player);
                 }
             }
             VideoState::Start => {
                 video_player.state = VideoState::Playing;
-                video_player.pipeline.as_ref().unwrap().play();
+                if let Some(video_player) = video_player.pipeline.as_ref() {
+                    video_player.play();
+                }
             }
             VideoState::Paused => {
-                video_player.pipeline.as_ref().unwrap().pause();
+                if let Some(video_player) = video_player.pipeline.as_ref() {
+                    video_player.pause();
+                }
+            }
+            VideoState::Stop => {
+                if let Some(video_player) = video_player.pipeline.as_ref() {
+                    video_player.destroy();
+                }
             }
             _ => {}
         }
