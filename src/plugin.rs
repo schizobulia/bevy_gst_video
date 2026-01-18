@@ -142,16 +142,16 @@ pub fn render_video_frame(
             }
             VideoState::Init => {
                 if video_player.id.is_some() {
-                    println!("[DEBUG] State: Init -> Ready, initializing video player");
+                    // println!("[DEBUG] State: Init -> Ready, initializing video player");
                     video_player.state = VideoState::Ready;
                     initialize_video_player(&mut video_player);
                 }
             }
             VideoState::Start => {
-                println!("[DEBUG] State: Start, checking if ready...");
+                // println!("[DEBUG] State: Start, checking if ready...");
                 // Initialize pipeline if not already done (handles Init -> Start skip)
                 if video_player.pipeline.is_none() {
-                    println!("[DEBUG] Pipeline was None, initializing...");
+                    // println!("[DEBUG] Pipeline was None, initializing...");
                     initialize_video_player(&mut video_player);
                 }
                 // Check if video is ready
@@ -162,13 +162,13 @@ pub fn render_video_frame(
                     .unwrap_or(false);
 
                 if is_ready {
-                    println!("[DEBUG] Video is ready, starting playback");
+                    // println!("[DEBUG] Video is ready, starting playback");
                     video_player.state = VideoState::Playing;
                     if let Some(ref pipeline) = video_player.pipeline {
                         pipeline.play();
                     }
                 } else {
-                    println!("[DEBUG] Video not ready yet, switching to Loading state");
+                    // println!("[DEBUG] Video not ready yet, switching to Loading state");
                     video_player.state = VideoState::Loading;
                 }
             }
@@ -181,7 +181,7 @@ pub fn render_video_frame(
                     .unwrap_or(false);
 
                 if is_ready {
-                    println!("[DEBUG] Video is now ready, starting playback");
+                    // println!("[DEBUG] Video is now ready, starting playback");
                     video_player.state = VideoState::Playing;
                     if let Some(ref pipeline) = video_player.pipeline {
                         pipeline.play();

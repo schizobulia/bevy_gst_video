@@ -29,6 +29,7 @@ pub struct VideoInfo {
 
 /// Audio format info extracted from video
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct AudioFormat {
     pub sample_rate: u32,
     pub channels: u16,
@@ -36,6 +37,7 @@ pub struct AudioFormat {
 
 /// Lock-free audio ring buffer for the audio callback
 pub type AudioProducer = ringbuf::HeapProd<f32>;
+#[allow(dead_code)]
 pub type AudioConsumer = ringbuf::HeapCons<f32>;
 
 pub struct FfmpegPlayer {
@@ -91,13 +93,13 @@ impl FfmpegPlayer {
     }
 
     pub fn play(&self) {
-        println!("[DEBUG] FfmpegPlayer::play() called");
+        // println!("[DEBUG] FfmpegPlayer::play() called");
         self.is_playing.store(true, Ordering::SeqCst);
-        println!("[DEBUG] is_playing set to true");
+        // println!("[DEBUG] is_playing set to true");
     }
 
     pub fn pause(&self) {
-        println!("[DEBUG] FfmpegPlayer::pause() called");
+        // println!("[DEBUG] FfmpegPlayer::pause() called");
         self.is_playing.store(false, Ordering::SeqCst);
     }
 
@@ -144,10 +146,10 @@ impl FfmpegPlayer {
         let system_sample_rate = default_config.sample_rate().0;
         let system_channels = default_config.channels().min(2); // Limit to stereo
 
-        println!(
-            "[DEBUG] System audio format: {} Hz, {} channels",
-            system_sample_rate, system_channels
-        );
+        // println!(
+        //     "[DEBUG] System audio format: {} Hz, {} channels",
+        //     system_sample_rate, system_channels
+        // );
 
         // Create a large ring buffer for audio samples (3 seconds of audio)
         let buffer_size = system_sample_rate as usize * system_channels as usize * 3;
@@ -236,28 +238,28 @@ impl FfmpegPlayer {
         is_ready: Arc<AtomicBool>,
         duration: Arc<Mutex<f64>>,
     ) -> Result<(), ffmpeg::Error> {
-        println!("[DEBUG] decode_loop starting, opening: {}", uri);
+        // println!("[DEBUG] decode_loop starting, opening: {}", uri);
         let mut ictx = input(&uri)?;
-        println!("[DEBUG] Input opened successfully");
+        // println!("[DEBUG] Input opened successfully");
 
         // Get video duration in seconds
         let duration_secs = ictx.duration() as f64 / f64::from(ffmpeg::ffi::AV_TIME_BASE);
         if let Ok(mut d) = duration.lock() {
             *d = duration_secs;
         }
-        println!("[DEBUG] Video duration: {:.2} seconds", duration_secs);
+        // println!("[DEBUG] Video duration: {:.2} seconds", duration_secs);
 
         let video_stream_index = ictx
             .streams()
             .best(Type::Video)
             .map(|s| s.index());
-        println!("[DEBUG] Video stream index: {:?}", video_stream_index);
+        // println!("[DEBUG] Video stream index: {:?}", video_stream_index);
 
         let audio_stream_index = ictx
             .streams()
             .best(Type::Audio)
             .map(|s| s.index());
-        println!("[DEBUG] Audio stream index: {:?}", audio_stream_index);
+        // println!("[DEBUG] Audio stream index: {:?}", audio_stream_index);
 
         let mut video_decoder = video_stream_index
             .and_then(|idx| ictx.stream(idx))
@@ -279,16 +281,16 @@ impl FfmpegPlayer {
         let detected_format = if let Some(ref decoder) = audio_decoder {
             let rate = decoder.rate();
             let channels = decoder.channels() as u16;
-            println!(
-                "[DEBUG] Detected audio format: {} Hz, {} channels, format: {:?}",
-                rate, channels, decoder.format()
-            );
+            // println!(
+            //     "[DEBUG] Detected audio format: {} Hz, {} channels, format: {:?}",
+            //     rate, channels, decoder.format()
+            // );
             Some(AudioFormat {
                 sample_rate: rate,
                 channels,
             })
         } else {
-            println!("[DEBUG] No audio stream found");
+            // println!("[DEBUG] No audio stream found");
             None
         };
 
@@ -324,7 +326,7 @@ impl FfmpegPlayer {
         let mut scaler: Option<ScalingContext> = None;
         let mut resampler: Option<ffmpeg::software::resampling::Context> = None;
 
-        println!("[DEBUG] Starting packet loop, waiting for is_playing...");
+        // println!("[DEBUG] Starting packet loop, waiting for is_playing...");
         let mut frame_count = 0u64;
         let mut prebuffering = true;
         const PREBUFFER_FRAMES: usize = 30; // Prebuffer ~1 second of video
@@ -332,11 +334,11 @@ impl FfmpegPlayer {
         let prebuffer_audio_samples = (target_sample_rate as usize) * (target_channels as usize) / 2;
         let mut audio_samples_pushed: usize = 0;
         
-        println!("[DEBUG] Prebuffer targets: {} video frames, {} audio samples", PREBUFFER_FRAMES, prebuffer_audio_samples);
+        // println!("[DEBUG] Prebuffer targets: {} video frames, {} audio samples", PREBUFFER_FRAMES, prebuffer_audio_samples);
 
         for (stream, packet) in ictx.packets() {
             if should_stop.load(Ordering::Relaxed) {
-                println!("[DEBUG] should_stop is true, breaking");
+                // println!("[DEBUG] should_stop is true, breaking");
                 break;
             }
 
@@ -346,13 +348,13 @@ impl FfmpegPlayer {
                 let audio_ready = audio_samples_pushed >= prebuffer_audio_samples;
                 
                 if frame_count % 10 == 0 {
-                    let video_len = frame_queue.lock().map(|f| f.len()).unwrap_or(0);
-                    println!("[DEBUG] Prebuffering: video {}/{}, audio {}/{}", 
-                             video_len, PREBUFFER_FRAMES, audio_samples_pushed, prebuffer_audio_samples);
+                    let _video_len = frame_queue.lock().map(|f| f.len()).unwrap_or(0);
+                    // println!("[DEBUG] Prebuffering: video {}/{}, audio {}/{}", 
+                    //          _video_len, PREBUFFER_FRAMES, audio_samples_pushed, prebuffer_audio_samples);
                 }
 
                 if video_ready && audio_ready {
-                    println!("[DEBUG] Prebuffering complete, marking as ready");
+                    // println!("[DEBUG] Prebuffering complete, marking as ready");
                     is_ready.store(true, Ordering::SeqCst);
                     prebuffering = false;
                 }
@@ -366,7 +368,7 @@ impl FfmpegPlayer {
             }
 
             if frame_count == 0 && is_playing.load(Ordering::Relaxed) {
-                println!("[DEBUG] is_playing became true, starting playback");
+                // println!("[DEBUG] is_playing became true, starting playback");
             }
 
             if should_stop.load(Ordering::Relaxed) {
@@ -375,9 +377,9 @@ impl FfmpegPlayer {
 
             if Some(stream.index()) == video_stream_index {
                 frame_count += 1;
-                if frame_count % 100 == 0 {
-                    println!("[DEBUG] Decoded {} video frames", frame_count);
-                }
+                // if frame_count % 100 == 0 {
+                //     println!("[DEBUG] Decoded {} video frames", frame_count);
+                // }
                 if let Some(ref mut decoder) = video_decoder {
                     decoder.send_packet(&packet)?;
 
@@ -468,13 +470,13 @@ impl FfmpegPlayer {
                                     target_layout,
                                     target_sample_rate,
                                 )?);
-                                println!(
-                                    "[DEBUG] Created resampler: {:?} {} Hz -> F32 packed {} Hz, {} channels",
-                                    decoded.format(),
-                                    decoded.rate(),
-                                    target_sample_rate,
-                                    target_channels
-                                );
+                                // println!(
+                                //     "[DEBUG] Created resampler: {:?} {} Hz -> F32 packed {} Hz, {} channels",
+                                //     decoded.format(),
+                                //     decoded.rate(),
+                                //     target_sample_rate,
+                                //     target_channels
+                                // );
                             }
 
                             if let Some(ref mut resampler) = resampler {
@@ -536,7 +538,7 @@ impl FfmpegPlayer {
             }
         }
 
-        println!("EOS");
+        // println!("EOS");
         Ok(())
     }
 }

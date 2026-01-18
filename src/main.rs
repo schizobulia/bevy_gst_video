@@ -18,13 +18,23 @@ struct ProgressFill;
 struct ProgressText;
 
 #[derive(Component)]
-struct ButtonText;
+struct PlayButton;
+
+#[derive(Component)]
+struct StopButton;
 
 fn main() {
     App::new()
-        .add_plugins((DefaultPlugins, plugin::VideoPlugin))
+        .add_plugins((DefaultPlugins.set(WindowPlugin {
+            primary_window: Some(Window {
+                title: "Bevy Video Player".to_string(),
+                resolution: (800, 650).into(),
+                ..default()
+            }),
+            ..default()
+        }), plugin::VideoPlugin))
         .add_systems(Startup, start_up)
-        .add_systems(Update, (update, plugin::render_video_frame, update_status_text, update_progress))
+        .add_systems(Update, (update, plugin::render_video_frame, update_status_text, update_progress, button_hover_effect))
         .run();
 }
 
@@ -35,158 +45,243 @@ fn start_up(mut commands: Commands, images: ResMut<Assets<Image>>, asset_server:
         uri: uri.to_string(),
         state: VideoState::Init,
         timer: Arc::new(Mutex::new(Timer::from_seconds(0.001, TimerMode::Repeating))),
-        width: 500.0,
-        height: 500.0,
+        width: 720.0,
+        height: 400.0,
         id: None,
         pipeline: None,
     };
-    commands
-        .spawn(insert_video_component(
-            images,
-            Vec2::new(video_player.width, video_player.height),
-        ))
-        .insert(video_player);
-
+    
     let font = asset_server.load("fonts/FiraMono-Medium.ttf");
 
+    // Main container
     commands
         .spawn(Node {
-            top: Val::Px(550.0),
-            left: Val::Px(200.0),
-            ..Default::default()
-        })
-        .with_children(|parent| {
-            parent
-                .spawn((
-                    Text::new("start    "),
-                    TextFont {
-                        font: font.clone(),
-                        font_size: 12.0,
-                        ..Default::default()
-                    },
-                    TextColor(Color::WHITE),
-                    ButtonText,
-                ))
-                .insert(Interaction::Pressed);
-            parent
-                .spawn((
-                    Text::new("   stop"),
-                    TextFont {
-                        font: font.clone(),
-                        font_size: 12.0,
-                        ..Default::default()
-                    },
-                    TextColor(Color::WHITE),
-                    ButtonText,
-                ))
-                .insert(Interaction::Pressed);
-        });
-
-    // Status text
-    commands
-        .spawn((
-            Text::new(""),
-            TextFont {
-                font: font.clone(),
-                font_size: 14.0,
-                ..Default::default()
-            },
-            TextColor(Color::srgb(1.0, 1.0, 0.0)),
-            Node {
-                position_type: PositionType::Absolute,
-                top: Val::Px(10.0),
-                left: Val::Px(10.0),
-                ..Default::default()
-            },
-            StatusText,
-        ));
-
-    // Progress bar container
-    commands
-        .spawn(Node {
-            position_type: PositionType::Absolute,
-            bottom: Val::Px(50.0),
-            left: Val::Px(150.0),
-            width: Val::Px(500.0),
-            height: Val::Px(20.0),
+            width: Val::Percent(100.0),
+            height: Val::Percent(100.0),
             flex_direction: FlexDirection::Column,
+            align_items: AlignItems::Center,
+            justify_content: JustifyContent::FlexStart,
+            padding: UiRect::all(Val::Px(20.0)),
             ..Default::default()
         })
         .with_children(|parent| {
-            // Progress bar background
-            parent
-                .spawn((
-                    Node {
-                        width: Val::Percent(100.0),
-                        height: Val::Px(8.0),
-                        ..Default::default()
-                    },
-                    BackgroundColor(Color::srgb(0.3, 0.3, 0.3)),
-                    ProgressBar,
-                ))
-                .with_children(|parent| {
-                    // Progress bar fill
-                    parent.spawn((
-                        Node {
-                            width: Val::Percent(0.0),
-                            height: Val::Percent(100.0),
-                            ..Default::default()
-                        },
-                        BackgroundColor(Color::srgb(0.2, 0.7, 1.0)),
-                        ProgressFill,
-                    ));
-                });
-
-            // Progress text (time display)
+            // Title
             parent.spawn((
-                Text::new("00:00 / 00:00"),
+                Text::new("Bevy Video Player"),
                 TextFont {
                     font: font.clone(),
-                    font_size: 12.0,
+                    font_size: 24.0,
                     ..Default::default()
                 },
                 TextColor(Color::WHITE),
-                ProgressText,
+                Node {
+                    margin: UiRect::bottom(Val::Px(15.0)),
+                    ..Default::default()
+                },
             ));
+
+            // Video container with border
+            parent
+                .spawn((
+                    Node {
+                        width: Val::Px(724.0),
+                        height: Val::Px(404.0),
+                        border: UiRect::all(Val::Px(2.0)),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        ..Default::default()
+                    },
+                    BorderColor::all(Color::srgb(0.3, 0.3, 0.3)),
+                    BackgroundColor(Color::BLACK),
+                ))
+                .with_children(|video_container| {
+                    video_container
+                        .spawn(insert_video_component(
+                            images,
+                            Vec2::new(video_player.width, video_player.height),
+                        ))
+                        .insert(video_player);
+                });
+
+            // Controls container
+            parent
+                .spawn(Node {
+                    width: Val::Px(720.0),
+                    margin: UiRect::top(Val::Px(15.0)),
+                    flex_direction: FlexDirection::Column,
+                    ..Default::default()
+                })
+                .with_children(|controls| {
+                    // Progress bar
+                    controls
+                        .spawn(Node {
+                            width: Val::Percent(100.0),
+                            height: Val::Px(6.0),
+                            margin: UiRect::bottom(Val::Px(10.0)),
+                            ..Default::default()
+                        })
+                        .with_children(|progress_container| {
+                            progress_container
+                                .spawn((
+                                    Node {
+                                        width: Val::Percent(100.0),
+                                        height: Val::Percent(100.0),
+                                        border: UiRect::all(Val::Px(1.0)),
+                                        ..Default::default()
+                                    },
+                                    BackgroundColor(Color::srgb(0.15, 0.15, 0.15)),
+                                    BorderColor::all(Color::srgb(0.3, 0.3, 0.3)),
+                                    ProgressBar,
+                                ))
+                                .with_children(|bar| {
+                                    bar.spawn((
+                                        Node {
+                                            width: Val::Percent(0.0),
+                                            height: Val::Percent(100.0),
+                                            ..Default::default()
+                                        },
+                                        BackgroundColor(Color::srgb(0.0, 0.6, 1.0)),
+                                        ProgressFill,
+                                    ));
+                                });
+                        });
+
+                    // Time and buttons row
+                    controls
+                        .spawn(Node {
+                            width: Val::Percent(100.0),
+                            justify_content: JustifyContent::SpaceBetween,
+                            align_items: AlignItems::Center,
+                            ..Default::default()
+                        })
+                        .with_children(|row| {
+                            // Time display
+                            row.spawn((
+                                Text::new("00:00 / 00:00"),
+                                TextFont {
+                                    font: font.clone(),
+                                    font_size: 14.0,
+                                    ..Default::default()
+                                },
+                                TextColor(Color::srgb(0.7, 0.7, 0.7)),
+                                ProgressText,
+                            ));
+
+                            // Buttons container
+                            row.spawn(Node {
+                                column_gap: Val::Px(10.0),
+                                ..Default::default()
+                            })
+                            .with_children(|buttons| {
+                                // Play button
+                                buttons
+                                    .spawn((
+                                        Node {
+                                            padding: UiRect::axes(Val::Px(20.0), Val::Px(8.0)),
+                                            border: UiRect::all(Val::Px(1.0)),
+                                            ..Default::default()
+                                        },
+                                        BackgroundColor(Color::srgb(0.0, 0.5, 0.2)),
+                                        BorderColor::all(Color::srgb(0.0, 0.7, 0.3)),
+                                        Interaction::None,
+                                        PlayButton,
+                                    ))
+                                    .with_children(|btn| {
+                                        btn.spawn((
+                                            Text::new("Play"),
+                                            TextFont {
+                                                font: font.clone(),
+                                                font_size: 14.0,
+                                                ..Default::default()
+                                            },
+                                            TextColor(Color::WHITE),
+                                        ));
+                                    });
+
+                                // Stop button
+                                buttons
+                                    .spawn((
+                                        Node {
+                                            padding: UiRect::axes(Val::Px(20.0), Val::Px(8.0)),
+                                            border: UiRect::all(Val::Px(1.0)),
+                                            ..Default::default()
+                                        },
+                                        BackgroundColor(Color::srgb(0.5, 0.1, 0.1)),
+                                        BorderColor::all(Color::srgb(0.7, 0.2, 0.2)),
+                                        Interaction::None,
+                                        StopButton,
+                                    ))
+                                    .with_children(|btn| {
+                                        btn.spawn((
+                                            Text::new("Stop"),
+                                            TextFont {
+                                                font: font.clone(),
+                                                font_size: 14.0,
+                                                ..Default::default()
+                                            },
+                                            TextColor(Color::WHITE),
+                                        ));
+                                    });
+                            });
+
+                            // Status text
+                            row.spawn((
+                                Text::new("Ready"),
+                                TextFont {
+                                    font: font.clone(),
+                                    font_size: 14.0,
+                                    ..Default::default()
+                                },
+                                TextColor(Color::srgb(0.6, 0.8, 1.0)),
+                                StatusText,
+                            ));
+                        });
+                });
         });
 }
 
-fn update(
-    query: Query<(&Interaction, &Text), (Changed<Interaction>, With<ButtonText>)>,
-    mut query_video: Query<(&mut VideoPlayer, Entity, &mut ImageNode)>,
+fn button_hover_effect(
+    mut play_query: Query<(&Interaction, &mut BackgroundColor), (Changed<Interaction>, With<PlayButton>)>,
+    mut stop_query: Query<(&Interaction, &mut BackgroundColor), (Changed<Interaction>, With<StopButton>, Without<PlayButton>)>,
 ) {
-    for (mut video_player, id, _) in query_video.iter_mut() {
+    for (interaction, mut bg) in play_query.iter_mut() {
+        *bg = match interaction {
+            Interaction::Hovered => BackgroundColor(Color::srgb(0.0, 0.6, 0.3)),
+            Interaction::Pressed => BackgroundColor(Color::srgb(0.0, 0.4, 0.15)),
+            Interaction::None => BackgroundColor(Color::srgb(0.0, 0.5, 0.2)),
+        };
+    }
+    for (interaction, mut bg) in stop_query.iter_mut() {
+        *bg = match interaction {
+            Interaction::Hovered => BackgroundColor(Color::srgb(0.6, 0.15, 0.15)),
+            Interaction::Pressed => BackgroundColor(Color::srgb(0.4, 0.08, 0.08)),
+            Interaction::None => BackgroundColor(Color::srgb(0.5, 0.1, 0.1)),
+        };
+    }
+}
+
+fn update(
+    play_query: Query<&Interaction, (Changed<Interaction>, With<PlayButton>)>,
+    stop_query: Query<&Interaction, (Changed<Interaction>, With<StopButton>)>,
+    mut query_video: Query<(&mut VideoPlayer, Entity)>,
+) {
+    for (mut video_player, id) in query_video.iter_mut() {
         if video_player.id.is_none() {
             video_player.id = Some(id);
-            println!("[DEBUG] VideoPlayer id set: {:?}", id);
+            // println!("[DEBUG] VideoPlayer id set: {:?}", id);
         }
 
-        for (interaction, text) in query.iter() {
-            let btn_text = text.0.trim();
-            println!("[DEBUG] Interaction: {:?}, Button: {}, State: {:?}", interaction, btn_text, video_player.state);
+        for interaction in play_query.iter() {
+            if *interaction == Interaction::Pressed && video_player.state != VideoState::Loading {
+                // println!("[DEBUG] Play button pressed! Changing state to Start");
+                video_player.state = VideoState::Start;
+            }
+        }
 
-            match interaction {
-                Interaction::Pressed => {
-                    if video_player.id.is_some() {
-                        match btn_text {
-                            "start" => {
-                                // Prevent multiple clicks while loading
-                                if video_player.state != VideoState::Loading {
-                                    println!("[DEBUG] Start button pressed! Changing state to Start");
-                                    video_player.state = VideoState::Start;
-                                }
-                            }
-                            "stop" => {
-                                println!("[DEBUG] Stop button pressed! Changing state to Paused");
-                                video_player.state = VideoState::Paused;
-                            }
-                            _ => {}
-                        }
-                    } else {
-                        println!("[DEBUG] Button pressed but video_player.id is None");
-                    }
-                }
-                _ => {}
+        for interaction in stop_query.iter() {
+            if *interaction == Interaction::Pressed {
+                // println!("[DEBUG] Stop button pressed! Changing state to Paused");
+                video_player.state = VideoState::Paused;
             }
         }
     }
@@ -199,9 +294,9 @@ fn update_status_text(
     for video_player in query_video.iter() {
         for mut text in query_status.iter_mut() {
             let status = match video_player.state {
-                VideoState::Init => "Initializing...",
+                VideoState::Init => "Initializing",
                 VideoState::Ready => "Ready",
-                VideoState::Loading => "Loading video...",
+                VideoState::Loading => "Loading...",
                 VideoState::Playing => "Playing",
                 VideoState::Paused => "Paused",
                 VideoState::Start => "Starting...",
@@ -226,12 +321,11 @@ fn update_progress(
 
         if is_loading {
             // Show loading animation
-            let loading_progress = (time.elapsed_secs() * 2.0).sin() * 0.5 + 0.5;
+            let loading_progress = (time.elapsed_secs() * 3.0).sin() * 0.3 + 0.5;
 
             for (mut node, mut bg_color) in query_fill.iter_mut() {
                 node.width = Val::Percent(loading_progress * 100.0);
-                // Pulsing color for loading
-                bg_color.0 = Color::srgb(0.5, 0.5 + loading_progress * 0.3, 1.0);
+                bg_color.0 = Color::srgb(0.3, 0.5, 1.0);
             }
 
             for mut text in query_text.iter_mut() {
@@ -248,14 +342,11 @@ fn update_progress(
             let position = video_player.position();
             let duration = video_player.duration();
 
-            // Update progress bar fill
             for (mut node, mut bg_color) in query_fill.iter_mut() {
                 node.width = Val::Percent(progress * 100.0);
-                // Normal playback color
-                bg_color.0 = Color::srgb(0.2, 0.7, 1.0);
+                bg_color.0 = Color::srgb(0.0, 0.6, 1.0);
             }
 
-            // Update time display
             for mut text in query_text.iter_mut() {
                 let pos_min = (position / 60.0) as u32;
                 let pos_sec = (position % 60.0) as u32;
