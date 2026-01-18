@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use crate::video::GstPlayer;
+use crate::video::FfmpegPlayer;
 
 #[derive(Debug, Clone, Copy)]
 pub enum VideoState {
@@ -30,7 +30,7 @@ pub struct VideoPlayer {
     pub width: f32,
     pub height: f32,
     pub uri: String,
-    pub pipeline: Option<GstPlayer>,
+    pub pipeline: Option<FfmpegPlayer>,
 }
 
 pub struct VideoPlugin;
@@ -60,9 +60,19 @@ fn handle_playing_state(
                             );
                             image_handle.texture = images.add(canvas);
                             if let Ok(mut pts) = ref_pipeline.previous_pts.lock() {
-                                let dt = (data.pts - *pts) / 1_000_000;
-                                player_time.set_duration(Duration::from_millis(dt));
-                                *pts = data.pts;
+                                // Handle first frame: initialize previous_pts
+                                if *pts == 0 {
+                                    *pts = data.pts;
+                                    player_time.set_duration(Duration::from_millis(33)); // ~30fps default
+                                } else if data.pts > *pts {
+                                    let dt = (data.pts - *pts) / 1_000_000;
+                                    // Clamp dt to reasonable range (1ms - 100ms)
+                                    let dt = dt.max(1).min(100);
+                                    player_time.set_duration(Duration::from_millis(dt));
+                                    *pts = data.pts;
+                                } else {
+                                    *pts = data.pts;
+                                }
                             }
                         }
                     }
@@ -73,7 +83,7 @@ fn handle_playing_state(
 }
 
 fn initialize_video_player(video_player: &mut VideoPlayer) {
-    let pipeline = GstPlayer::new(video_player.uri.as_str());
+    let pipeline = FfmpegPlayer::new(video_player.uri.as_str());
     let pipeline_clone = Arc::new(Mutex::new(pipeline.clone()));
     thread::spawn(move || {
         if let Ok(mut pipeline) = pipeline_clone.lock() {
@@ -95,24 +105,34 @@ pub fn render_video_frame(
             }
             VideoState::Init => {
                 if video_player.id.is_some() {
+                    println!("[DEBUG] State: Init -> Ready, initializing video player");
                     video_player.state = VideoState::Ready;
                     initialize_video_player(&mut video_player);
                 }
             }
             VideoState::Start => {
+                println!("[DEBUG] State: Start -> Playing, calling play()");
+                // Initialize pipeline if not already done (handles Init -> Start skip)
+                if video_player.pipeline.is_none() {
+                    println!("[DEBUG] Pipeline was None, initializing...");
+                    initialize_video_player(&mut video_player);
+                }
                 video_player.state = VideoState::Playing;
-                if let Some(video_player) = video_player.pipeline.as_ref() {
-                    video_player.play();
+                if let Some(ref pipeline) = video_player.pipeline {
+                    pipeline.play();
+                    println!("[DEBUG] play() called, is_playing should be true");
+                } else {
+                    println!("[DEBUG] ERROR: pipeline is None!");
                 }
             }
             VideoState::Paused => {
-                if let Some(video_player) = video_player.pipeline.as_ref() {
-                    video_player.pause();
+                if let Some(ref pipeline) = video_player.pipeline {
+                    pipeline.pause();
                 }
             }
             VideoState::Stop => {
-                if let Some(video_player) = video_player.pipeline.as_ref() {
-                    video_player.destroy();
+                if let Some(ref pipeline) = video_player.pipeline {
+                    pipeline.destroy();
                 }
             }
             _ => {}

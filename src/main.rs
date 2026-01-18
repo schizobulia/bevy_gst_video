@@ -19,7 +19,7 @@ fn start_up(mut commands: Commands, images: ResMut<Assets<Image>>, asset_server:
     let video_player = VideoPlayer {
         uri: uri.to_string(),
         state: VideoState::Init,
-        timer: Arc::new(Mutex::new(Timer::from_seconds(1.0, TimerMode::Repeating))),
+        timer: Arc::new(Mutex::new(Timer::from_seconds(0.001, TimerMode::Repeating))),
         width: 500.0,
         height: 500.0,
         id: None,
@@ -68,31 +68,39 @@ fn start_up(mut commands: Commands, images: ResMut<Assets<Image>>, asset_server:
 }
 
 fn update(
-    mut query: Query<(&Interaction, &mut Text)>,
+    mut query: Query<(&Interaction, &mut Text), Changed<Interaction>>,
     mut query_video: Query<(&mut VideoPlayer, Entity, &mut UiImage)>,
 ) {
     for (mut video_player, id, _) in query_video.iter_mut() {
+        if video_player.id.is_none() {
+            video_player.id = Some(id);
+            println!("[DEBUG] VideoPlayer id set: {:?}", id);
+        }
+
         for (interaction, text) in query.iter_mut() {
+            let btn_text = text.sections[0].value.trim();
+            println!("[DEBUG] Interaction: {:?}, Button: {}, State: {:?}", interaction, btn_text, video_player.state);
+
             match interaction {
                 Interaction::Pressed => {
                     if video_player.id.is_some() {
-                        match text.sections[0].value.trim() {
+                        match btn_text {
                             "start" => {
+                                println!("[DEBUG] Start button pressed! Changing state to Start");
                                 video_player.state = VideoState::Start;
                             }
                             "stop" => {
+                                println!("[DEBUG] Stop button pressed! Changing state to Paused");
                                 video_player.state = VideoState::Paused;
                             }
                             _ => {}
                         }
+                    } else {
+                        println!("[DEBUG] Button pressed but video_player.id is None");
                     }
                 }
                 _ => {}
             }
-        }
-
-        if video_player.id.is_none() {
-            video_player.id = Some(id);
         }
     }
 }
