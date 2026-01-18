@@ -214,26 +214,55 @@ fn update_status_text(
 
 fn update_progress(
     query_video: Query<&VideoPlayer>,
-    mut query_fill: Query<&mut Node, With<ProgressFill>>,
+    mut query_fill: Query<(&mut Node, &mut BackgroundColor), With<ProgressFill>>,
     mut query_text: Query<&mut Text, With<ProgressText>>,
+    time: Res<Time>,
 ) {
     for video_player in query_video.iter() {
-        let progress = video_player.progress();
-        let position = video_player.position();
-        let duration = video_player.duration();
+        let is_loading = matches!(
+            video_player.state,
+            VideoState::Loading | VideoState::Start | VideoState::Init
+        );
 
-        // Update progress bar fill
-        for mut node in query_fill.iter_mut() {
-            node.width = Val::Percent(progress * 100.0);
-        }
+        if is_loading {
+            // Show loading animation
+            let loading_progress = (time.elapsed_secs() * 2.0).sin() * 0.5 + 0.5;
 
-        // Update time display
-        for mut text in query_text.iter_mut() {
-            let pos_min = (position / 60.0) as u32;
-            let pos_sec = (position % 60.0) as u32;
-            let dur_min = (duration / 60.0) as u32;
-            let dur_sec = (duration % 60.0) as u32;
-            text.0 = format!("{:02}:{:02} / {:02}:{:02}", pos_min, pos_sec, dur_min, dur_sec);
+            for (mut node, mut bg_color) in query_fill.iter_mut() {
+                node.width = Val::Percent(loading_progress * 100.0);
+                // Pulsing color for loading
+                bg_color.0 = Color::srgb(0.5, 0.5 + loading_progress * 0.3, 1.0);
+            }
+
+            for mut text in query_text.iter_mut() {
+                let dots = match ((time.elapsed_secs() * 2.0) as u32) % 4 {
+                    0 => "",
+                    1 => ".",
+                    2 => "..",
+                    _ => "...",
+                };
+                text.0 = format!("Loading{}", dots);
+            }
+        } else {
+            let progress = video_player.progress();
+            let position = video_player.position();
+            let duration = video_player.duration();
+
+            // Update progress bar fill
+            for (mut node, mut bg_color) in query_fill.iter_mut() {
+                node.width = Val::Percent(progress * 100.0);
+                // Normal playback color
+                bg_color.0 = Color::srgb(0.2, 0.7, 1.0);
+            }
+
+            // Update time display
+            for mut text in query_text.iter_mut() {
+                let pos_min = (position / 60.0) as u32;
+                let pos_sec = (position % 60.0) as u32;
+                let dur_min = (duration / 60.0) as u32;
+                let dur_sec = (duration % 60.0) as u32;
+                text.0 = format!("{:02}:{:02} / {:02}:{:02}", pos_min, pos_sec, dur_min, dur_sec);
+            }
         }
     }
 }

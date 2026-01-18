@@ -36,11 +36,11 @@ pub struct AudioBuffer {
 }
 
 impl AudioBuffer {
-    pub fn new() -> Self {
+    pub fn new(sample_rate: u32, channels: u16) -> Self {
         Self {
             samples: VecDeque::new(),
-            sample_rate: 44100,
-            channels: 2,
+            sample_rate,
+            channels,
             last_sample: 0.0,
             fade_factor: 1.0,
         }
@@ -60,9 +60,17 @@ impl AudioBuffer {
     }
 }
 
+/// Audio format info extracted from video
+#[derive(Clone, Debug)]
+pub struct AudioFormat {
+    pub sample_rate: u32,
+    pub channels: u16,
+}
+
 pub struct FfmpegPlayer {
     pub frame: Arc<Mutex<VecDeque<VideoInfo>>>,
-    pub audio_buffer: Arc<Mutex<AudioBuffer>>,
+    pub audio_buffer: Arc<Mutex<Option<AudioBuffer>>>,
+    pub audio_format: Arc<Mutex<Option<AudioFormat>>>,
     pub previous_pts: Arc<Mutex<u64>>,
     pub duration: Arc<Mutex<f64>>,
     pub current_position: Arc<Mutex<f64>>,
@@ -79,6 +87,7 @@ impl Clone for FfmpegPlayer {
         Self {
             frame: Arc::clone(&self.frame),
             audio_buffer: Arc::clone(&self.audio_buffer),
+            audio_format: Arc::clone(&self.audio_format),
             previous_pts: Arc::clone(&self.previous_pts),
             duration: Arc::clone(&self.duration),
             current_position: Arc::clone(&self.current_position),
@@ -96,7 +105,8 @@ impl FfmpegPlayer {
 
         Self {
             frame: Arc::new(Mutex::new(VecDeque::new())),
-            audio_buffer: Arc::new(Mutex::new(AudioBuffer::new())),
+            audio_buffer: Arc::new(Mutex::new(None)),
+            audio_format: Arc::new(Mutex::new(None)),
             previous_pts: Arc::new(Mutex::new(0)),
             duration: Arc::new(Mutex::new(0.0)),
             current_position: Arc::new(Mutex::new(0.0)),
@@ -126,6 +136,7 @@ impl FfmpegPlayer {
     pub fn start(&mut self) {
         let frame_queue = Arc::clone(&self.frame);
         let audio_buffer = Arc::clone(&self.audio_buffer);
+        let audio_format = Arc::clone(&self.audio_format);
         let is_playing = Arc::clone(&self.is_playing);
         let should_stop = Arc::clone(&self.should_stop);
         let is_ready = Arc::clone(&self.is_ready);
@@ -133,17 +144,11 @@ impl FfmpegPlayer {
         let uri = self.uri.clone();
 
         thread::spawn(move || {
-            // Setup audio output in the decoder thread
-            let audio_stream =
-                Self::setup_audio_output(Arc::clone(&audio_buffer), Arc::clone(&is_playing));
-            if let Some(ref stream) = audio_stream {
-                let _ = stream.play();
-            }
-
             if let Err(e) = Self::decode_loop(
                 &uri,
                 frame_queue,
                 audio_buffer,
+                audio_format,
                 is_playing,
                 should_stop,
                 is_ready,
@@ -151,21 +156,25 @@ impl FfmpegPlayer {
             ) {
                 eprintln!("Decode error: {}", e);
             }
-
-            // Audio stream is dropped here when decode loop ends
         });
     }
 
     fn setup_audio_output(
-        audio_buffer: Arc<Mutex<AudioBuffer>>,
+        audio_buffer: Arc<Mutex<Option<AudioBuffer>>>,
         is_playing: Arc<AtomicBool>,
+        format: &AudioFormat,
     ) -> Option<cpal::Stream> {
         let host = cpal::default_host();
         let device = host.default_output_device()?;
 
+        println!(
+            "[DEBUG] Setting up audio output: {} Hz, {} channels",
+            format.sample_rate, format.channels
+        );
+
         let config = cpal::StreamConfig {
-            channels: 2,
-            sample_rate: cpal::SampleRate(44100),
+            channels: format.channels,
+            sample_rate: cpal::SampleRate(format.sample_rate),
             buffer_size: cpal::BufferSize::Default,
         };
 
@@ -173,19 +182,26 @@ impl FfmpegPlayer {
             .build_output_stream(
                 &config,
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                    if let Ok(mut buffer) = audio_buffer.lock() {
-                        // Check if playing
-                        if !is_playing.load(Ordering::Relaxed) {
-                            // Output silence when paused, with fade out
-                            for sample in data.iter_mut() {
-                                let s = buffer.next_sample();
-                                buffer.fade_factor *= 0.9;
-                                *sample = s * buffer.fade_factor;
+                    if let Ok(mut buffer_opt) = audio_buffer.lock() {
+                        if let Some(ref mut buffer) = *buffer_opt {
+                            // Check if playing
+                            if !is_playing.load(Ordering::Relaxed) {
+                                // Output silence when paused, with fade out
+                                for sample in data.iter_mut() {
+                                    let s = buffer.next_sample();
+                                    buffer.fade_factor *= 0.9;
+                                    *sample = s * buffer.fade_factor;
+                                }
+                                return;
                             }
-                            return;
-                        }
-                        for sample in data.iter_mut() {
-                            *sample = buffer.next_sample();
+                            for sample in data.iter_mut() {
+                                *sample = buffer.next_sample();
+                            }
+                        } else {
+                            // Buffer not initialized yet
+                            for sample in data.iter_mut() {
+                                *sample = 0.0;
+                            }
                         }
                     } else {
                         // Lock failed, output silence
@@ -205,7 +221,8 @@ impl FfmpegPlayer {
     fn decode_loop(
         uri: &str,
         frame_queue: Arc<Mutex<VecDeque<VideoInfo>>>,
-        audio_buffer: Arc<Mutex<AudioBuffer>>,
+        audio_buffer: Arc<Mutex<Option<AudioBuffer>>>,
+        audio_format: Arc<Mutex<Option<AudioFormat>>>,
         is_playing: Arc<AtomicBool>,
         should_stop: Arc<AtomicBool>,
         is_ready: Arc<AtomicBool>,
@@ -221,9 +238,6 @@ impl FfmpegPlayer {
             *d = duration_secs;
         }
         println!("[DEBUG] Video duration: {:.2} seconds", duration_secs);
-
-        // Mark as ready after successfully opening the video
-        is_ready.store(true, Ordering::Relaxed);
 
         let video_stream_index = ictx
             .streams()
@@ -253,6 +267,48 @@ impl FfmpegPlayer {
             })
             .flatten();
 
+        // Read audio format from the decoder and set up audio output
+        let detected_format = if let Some(ref decoder) = audio_decoder {
+            let rate = decoder.rate();
+            let channels = decoder.channels() as u16;
+            println!(
+                "[DEBUG] Detected audio format: {} Hz, {} channels, format: {:?}",
+                rate, channels, decoder.format()
+            );
+            Some(AudioFormat {
+                sample_rate: rate,
+                channels,
+            })
+        } else {
+            println!("[DEBUG] No audio stream found");
+            None
+        };
+
+        // Store audio format and initialize audio buffer
+        let audio_stream = if let Some(ref fmt) = detected_format {
+            if let Ok(mut format_lock) = audio_format.lock() {
+                *format_lock = Some(fmt.clone());
+            }
+            if let Ok(mut buffer_lock) = audio_buffer.lock() {
+                *buffer_lock = Some(AudioBuffer::new(fmt.sample_rate, fmt.channels));
+            }
+            // Setup audio output with detected format
+            let stream = Self::setup_audio_output(
+                Arc::clone(&audio_buffer),
+                Arc::clone(&is_playing),
+                fmt,
+            );
+            if let Some(ref s) = stream {
+                let _ = s.play();
+            }
+            stream
+        } else {
+            None
+        };
+
+        // Keep audio stream alive
+        let _audio_stream = audio_stream;
+
         let video_time_base = video_stream_index
             .and_then(|idx| ictx.stream(idx))
             .map(|s| s.time_base());
@@ -260,11 +316,15 @@ impl FfmpegPlayer {
         let mut scaler: Option<ScalingContext> = None;
         let mut resampler: Option<ffmpeg::software::resampling::Context> = None;
 
+        // Use detected format for resampler target, or default
+        let target_sample_rate = detected_format.as_ref().map(|f| f.sample_rate).unwrap_or(44100);
+        let target_channels = detected_format.as_ref().map(|f| f.channels).unwrap_or(2);
+
         println!("[DEBUG] Starting packet loop, waiting for is_playing...");
         let mut frame_count = 0u64;
         let mut prebuffering = true;
         const PREBUFFER_FRAMES: usize = 30; // Prebuffer ~1 second of video
-        const PREBUFFER_AUDIO_SAMPLES: usize = 44100; // Prebuffer ~0.5 second of audio
+        let prebuffer_audio_samples = (target_sample_rate as usize) / 2; // Prebuffer ~0.5 second of audio
 
         for (stream, packet) in ictx.packets() {
             if should_stop.load(Ordering::Relaxed) {
@@ -275,10 +335,14 @@ impl FfmpegPlayer {
             // During prebuffering, decode without waiting for is_playing
             if prebuffering {
                 let video_ready = frame_queue.lock().map(|f| f.len() >= PREBUFFER_FRAMES).unwrap_or(false);
-                let audio_ready = audio_buffer.lock().map(|b| b.samples.len() >= PREBUFFER_AUDIO_SAMPLES).unwrap_or(false);
+                let audio_ready = audio_buffer
+                    .lock()
+                    .map(|b| b.as_ref().map(|buf| buf.samples.len() >= prebuffer_audio_samples).unwrap_or(true))
+                    .unwrap_or(false);
 
                 if video_ready && audio_ready {
-                    println!("[DEBUG] Prebuffering complete, waiting for play signal");
+                    println!("[DEBUG] Prebuffering complete, marking as ready");
+                    is_ready.store(true, Ordering::Relaxed);
                     prebuffering = false;
                 }
             }
@@ -377,39 +441,75 @@ impl FfmpegPlayer {
 
                     let mut decoded = ffmpeg::util::frame::audio::Audio::empty();
                     while decoder.receive_frame(&mut decoded).is_ok() {
+                        // Create resampler based on detected format (convert to F32 packed for cpal)
                         if resampler.is_none() {
+                            let target_layout = if target_channels == 1 {
+                                ffmpeg::channel_layout::ChannelLayout::MONO
+                            } else {
+                                ffmpeg::channel_layout::ChannelLayout::STEREO
+                            };
                             resampler = Some(ffmpeg::software::resampling::Context::get(
                                 decoded.format(),
                                 decoded.channel_layout(),
                                 decoded.rate(),
                                 ffmpeg::format::Sample::F32(ffmpeg::format::sample::Type::Packed),
-                                ffmpeg::channel_layout::ChannelLayout::STEREO,
-                                44100,
+                                target_layout,
+                                target_sample_rate,
                             )?);
+                            println!(
+                                "[DEBUG] Created resampler: {:?} {} Hz -> F32 packed {} Hz",
+                                decoded.format(),
+                                decoded.rate(),
+                                target_sample_rate
+                            );
                         }
 
                         if let Some(ref mut resampler) = resampler {
                             let mut resampled = ffmpeg::util::frame::audio::Audio::empty();
 
-                            if resampler.run(&decoded, &mut resampled).is_ok() && resampled.samples() > 0 {
-                                // Get actual number of samples * channels (stereo = 2)
-                                let actual_samples = resampled.samples() * 2;
-                                let plane = resampled.plane::<f32>(0);
+                            // Run resampler and collect output
+                            if resampler.run(&decoded, &mut resampled).is_ok() {
+                                // Process output samples
+                                let push_samples = |resampled: &ffmpeg::util::frame::audio::Audio,
+                                                   audio_buffer: &Arc<Mutex<Option<AudioBuffer>>>,
+                                                   should_stop: &Arc<AtomicBool>,
+                                                   num_channels: usize| {
+                                    if resampled.samples() == 0 {
+                                        return;
+                                    }
+                                    let actual_samples = resampled.samples() * num_channels;
+                                    let plane = resampled.plane::<f32>(0);
 
-                                // Wait if audio buffer is full to maintain sync
-                                const MAX_BUFFER_SIZE: usize = 44100 * 2 * 2;
-                                loop {
-                                    if let Ok(mut buffer) = audio_buffer.lock() {
-                                        if buffer.samples.len() < MAX_BUFFER_SIZE {
-                                            for i in 0..actual_samples.min(plane.len()) {
-                                                buffer.samples.push_back(plane[i]);
+                                    let max_buffer_size = target_sample_rate as usize * num_channels * 2;
+                                    loop {
+                                        if let Ok(mut buffer_opt) = audio_buffer.lock() {
+                                            if let Some(ref mut buffer) = *buffer_opt {
+                                                if buffer.samples.len() < max_buffer_size {
+                                                    for i in 0..actual_samples.min(plane.len()) {
+                                                        buffer.samples.push_back(plane[i]);
+                                                    }
+                                                    break;
+                                                }
+                                            } else {
+                                                break; // No buffer initialized
                                             }
+                                        }
+                                        thread::sleep(std::time::Duration::from_millis(5));
+                                        if should_stop.load(Ordering::Relaxed) {
                                             break;
                                         }
                                     }
-                                    thread::sleep(std::time::Duration::from_millis(5));
-                                    if should_stop.load(Ordering::Relaxed) {
-                                        break;
+                                };
+
+                                push_samples(&resampled, &audio_buffer, &should_stop, target_channels as usize);
+
+                                // Flush any remaining samples from resampler delay buffer
+                                if let Some(delay) = resampler.delay() {
+                                    if delay.output > 0 {
+                                        let mut flush_frame = ffmpeg::util::frame::audio::Audio::empty();
+                                        if resampler.flush(&mut flush_frame).is_ok() {
+                                            push_samples(&flush_frame, &audio_buffer, &should_stop, target_channels as usize);
+                                        }
                                     }
                                 }
                             }
