@@ -1,6 +1,7 @@
 use bevy::{
     prelude::*,
-    render::{render_asset::RenderAssetUsages, render_resource::Extent3d},
+    asset::RenderAssetUsages,
+    render::render_resource::Extent3d,
 };
 use image::DynamicImage;
 use std::{
@@ -11,13 +12,14 @@ use std::{
 
 use crate::video::FfmpegPlayer;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum VideoState {
     Init,
     Playing,
     Paused,
     Start,
     Ready,
+    Loading,
     #[allow(dead_code)]
     Stop,
 }
@@ -33,6 +35,36 @@ pub struct VideoPlayer {
     pub pipeline: Option<FfmpegPlayer>,
 }
 
+impl VideoPlayer {
+    /// Get current playback position in seconds
+    pub fn position(&self) -> f64 {
+        self.pipeline
+            .as_ref()
+            .and_then(|p| p.current_position.lock().ok())
+            .map(|p| *p)
+            .unwrap_or(0.0)
+    }
+
+    /// Get total video duration in seconds
+    pub fn duration(&self) -> f64 {
+        self.pipeline
+            .as_ref()
+            .and_then(|p| p.duration.lock().ok())
+            .map(|d| *d)
+            .unwrap_or(0.0)
+    }
+
+    /// Get playback progress as a ratio (0.0 to 1.0)
+    pub fn progress(&self) -> f32 {
+        let duration = self.duration();
+        if duration > 0.0 {
+            (self.position() / duration) as f32
+        } else {
+            0.0
+        }
+    }
+}
+
 pub struct VideoPlugin;
 
 impl Plugin for VideoPlugin {
@@ -41,7 +73,7 @@ impl Plugin for VideoPlugin {
 
 fn handle_playing_state(
     video_player: &mut VideoPlayer,
-    image_handle: &mut UiImage,
+    image_handle: &mut ImageNode,
     images: &mut Assets<Image>,
     time: &Res<Time>,
 ) {
@@ -50,6 +82,11 @@ fn handle_playing_state(
             if let Some(ref_pipeline) = video_player.pipeline.as_ref() {
                 if let Ok(mut frames) = ref_pipeline.frame.lock() {
                     if let Some(data) = frames.pop_front() {
+                        // Update current position based on the frame being rendered
+                        if let Ok(mut pos) = ref_pipeline.current_position.lock() {
+                            *pos = data.position_secs;
+                        }
+
                         if let Some(rbg_data) =
                             image::RgbaImage::from_raw(data.width, data.height, data.data)
                         {
@@ -58,7 +95,7 @@ fn handle_playing_state(
                                 true,
                                 RenderAssetUsages::default(),
                             );
-                            image_handle.texture = images.add(canvas);
+                            image_handle.image = images.add(canvas);
                             if let Ok(mut pts) = ref_pipeline.previous_pts.lock() {
                                 // Handle first frame: initialize previous_pts
                                 if *pts == 0 {
@@ -94,7 +131,7 @@ fn initialize_video_player(video_player: &mut VideoPlayer) {
 }
 
 pub fn render_video_frame(
-    mut query: Query<(&mut VideoPlayer, &mut UiImage)>,
+    mut query: Query<(&mut VideoPlayer, &mut ImageNode)>,
     mut images: ResMut<Assets<Image>>,
     time: Res<Time>,
 ) {
@@ -111,18 +148,44 @@ pub fn render_video_frame(
                 }
             }
             VideoState::Start => {
-                println!("[DEBUG] State: Start -> Playing, calling play()");
+                println!("[DEBUG] State: Start, checking if ready...");
                 // Initialize pipeline if not already done (handles Init -> Start skip)
                 if video_player.pipeline.is_none() {
                     println!("[DEBUG] Pipeline was None, initializing...");
                     initialize_video_player(&mut video_player);
                 }
-                video_player.state = VideoState::Playing;
-                if let Some(ref pipeline) = video_player.pipeline {
-                    pipeline.play();
-                    println!("[DEBUG] play() called, is_playing should be true");
+                // Check if video is ready
+                let is_ready = video_player
+                    .pipeline
+                    .as_ref()
+                    .map(|p| p.is_ready.load(std::sync::atomic::Ordering::Relaxed))
+                    .unwrap_or(false);
+
+                if is_ready {
+                    println!("[DEBUG] Video is ready, starting playback");
+                    video_player.state = VideoState::Playing;
+                    if let Some(ref pipeline) = video_player.pipeline {
+                        pipeline.play();
+                    }
                 } else {
-                    println!("[DEBUG] ERROR: pipeline is None!");
+                    println!("[DEBUG] Video not ready yet, switching to Loading state");
+                    video_player.state = VideoState::Loading;
+                }
+            }
+            VideoState::Loading => {
+                // Wait for video to be ready
+                let is_ready = video_player
+                    .pipeline
+                    .as_ref()
+                    .map(|p| p.is_ready.load(std::sync::atomic::Ordering::Relaxed))
+                    .unwrap_or(false);
+
+                if is_ready {
+                    println!("[DEBUG] Video is now ready, starting playback");
+                    video_player.state = VideoState::Playing;
+                    if let Some(ref pipeline) = video_player.pipeline {
+                        pipeline.play();
+                    }
                 }
             }
             VideoState::Paused => {
@@ -143,7 +206,7 @@ pub fn render_video_frame(
 pub fn insert_video_component(
     mut images: ResMut<Assets<Image>>,
     default_size: Vec2,
-) -> ImageBundle {
+) -> impl Bundle {
     let mut canvas = Image::from_dynamic(
         DynamicImage::new_rgb8(500, 500),
         true,
@@ -155,16 +218,12 @@ pub fn insert_video_component(
         ..default()
     });
     let image_handle = images.add(canvas);
-    ImageBundle {
-        image: UiImage {
-            texture: image_handle,
-            ..Default::default()
-        },
-        style: Style {
+    (
+        ImageNode::new(image_handle),
+        Node {
             width: Val::Px(default_size.x),
             height: Val::Px(default_size.y),
             ..Default::default()
         },
-        ..Default::default()
-    }
+    )
 }

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-bevy = "0.13.2"
+bevy = "0.18"
 ffmpeg-next = "7.0"
 cpal = "0.15"
-image = "0.24.0"
+image = "0.25"

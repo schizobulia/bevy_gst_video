@@ -23,6 +23,7 @@ pub struct VideoInfo {
     pub width: u32,
     pub data: Vec<u8>,
     pub pts: u64,
+    pub position_secs: f64,
 }
 
 #[allow(dead_code)]
@@ -30,6 +31,8 @@ pub struct AudioBuffer {
     pub samples: VecDeque<f32>,
     pub sample_rate: u32,
     pub channels: u16,
+    last_sample: f32,
+    fade_factor: f32,
 }
 
 impl AudioBuffer {
@@ -38,6 +41,21 @@ impl AudioBuffer {
             samples: VecDeque::new(),
             sample_rate: 44100,
             channels: 2,
+            last_sample: 0.0,
+            fade_factor: 1.0,
+        }
+    }
+
+    /// Get next sample with smooth fade to avoid pops when buffer is empty
+    pub fn next_sample(&mut self) -> f32 {
+        if let Some(sample) = self.samples.pop_front() {
+            self.last_sample = sample;
+            self.fade_factor = 1.0;
+            sample
+        } else {
+            // Smoothly fade out to avoid pop noise
+            self.fade_factor *= 0.95;
+            self.last_sample * self.fade_factor
         }
     }
 }
@@ -46,10 +64,12 @@ pub struct FfmpegPlayer {
     pub frame: Arc<Mutex<VecDeque<VideoInfo>>>,
     pub audio_buffer: Arc<Mutex<AudioBuffer>>,
     pub previous_pts: Arc<Mutex<u64>>,
-    pub duration: u64,
+    pub duration: Arc<Mutex<f64>>,
+    pub current_position: Arc<Mutex<f64>>,
 
     pub is_playing: Arc<AtomicBool>,
     pub should_stop: Arc<AtomicBool>,
+    pub is_ready: Arc<AtomicBool>,
 
     uri: String,
 }
@@ -60,9 +80,11 @@ impl Clone for FfmpegPlayer {
             frame: Arc::clone(&self.frame),
             audio_buffer: Arc::clone(&self.audio_buffer),
             previous_pts: Arc::clone(&self.previous_pts),
-            duration: self.duration,
+            duration: Arc::clone(&self.duration),
+            current_position: Arc::clone(&self.current_position),
             is_playing: Arc::clone(&self.is_playing),
             should_stop: Arc::clone(&self.should_stop),
+            is_ready: Arc::clone(&self.is_ready),
             uri: self.uri.clone(),
         }
     }
@@ -76,9 +98,11 @@ impl FfmpegPlayer {
             frame: Arc::new(Mutex::new(VecDeque::new())),
             audio_buffer: Arc::new(Mutex::new(AudioBuffer::new())),
             previous_pts: Arc::new(Mutex::new(0)),
-            duration: 0,
+            duration: Arc::new(Mutex::new(0.0)),
+            current_position: Arc::new(Mutex::new(0.0)),
             is_playing: Arc::new(AtomicBool::new(false)),
             should_stop: Arc::new(AtomicBool::new(false)),
+            is_ready: Arc::new(AtomicBool::new(false)),
             uri: uri.to_string(),
         }
     }
@@ -104,11 +128,14 @@ impl FfmpegPlayer {
         let audio_buffer = Arc::clone(&self.audio_buffer);
         let is_playing = Arc::clone(&self.is_playing);
         let should_stop = Arc::clone(&self.should_stop);
+        let is_ready = Arc::clone(&self.is_ready);
+        let duration = Arc::clone(&self.duration);
         let uri = self.uri.clone();
 
         thread::spawn(move || {
             // Setup audio output in the decoder thread
-            let audio_stream = Self::setup_audio_output(Arc::clone(&audio_buffer));
+            let audio_stream =
+                Self::setup_audio_output(Arc::clone(&audio_buffer), Arc::clone(&is_playing));
             if let Some(ref stream) = audio_stream {
                 let _ = stream.play();
             }
@@ -119,6 +146,8 @@ impl FfmpegPlayer {
                 audio_buffer,
                 is_playing,
                 should_stop,
+                is_ready,
+                duration,
             ) {
                 eprintln!("Decode error: {}", e);
             }
@@ -127,7 +156,10 @@ impl FfmpegPlayer {
         });
     }
 
-    fn setup_audio_output(audio_buffer: Arc<Mutex<AudioBuffer>>) -> Option<cpal::Stream> {
+    fn setup_audio_output(
+        audio_buffer: Arc<Mutex<AudioBuffer>>,
+        is_playing: Arc<AtomicBool>,
+    ) -> Option<cpal::Stream> {
         let host = cpal::default_host();
         let device = host.default_output_device()?;
 
@@ -142,8 +174,23 @@ impl FfmpegPlayer {
                 &config,
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     if let Ok(mut buffer) = audio_buffer.lock() {
+                        // Check if playing
+                        if !is_playing.load(Ordering::Relaxed) {
+                            // Output silence when paused, with fade out
+                            for sample in data.iter_mut() {
+                                let s = buffer.next_sample();
+                                buffer.fade_factor *= 0.9;
+                                *sample = s * buffer.fade_factor;
+                            }
+                            return;
+                        }
                         for sample in data.iter_mut() {
-                            *sample = buffer.samples.pop_front().unwrap_or(0.0);
+                            *sample = buffer.next_sample();
+                        }
+                    } else {
+                        // Lock failed, output silence
+                        for sample in data.iter_mut() {
+                            *sample = 0.0;
                         }
                     }
                 },
@@ -161,10 +208,22 @@ impl FfmpegPlayer {
         audio_buffer: Arc<Mutex<AudioBuffer>>,
         is_playing: Arc<AtomicBool>,
         should_stop: Arc<AtomicBool>,
+        is_ready: Arc<AtomicBool>,
+        duration: Arc<Mutex<f64>>,
     ) -> Result<(), ffmpeg::Error> {
         println!("[DEBUG] decode_loop starting, opening: {}", uri);
         let mut ictx = input(&uri)?;
         println!("[DEBUG] Input opened successfully");
+
+        // Get video duration in seconds
+        let duration_secs = ictx.duration() as f64 / f64::from(ffmpeg::ffi::AV_TIME_BASE);
+        if let Ok(mut d) = duration.lock() {
+            *d = duration_secs;
+        }
+        println!("[DEBUG] Video duration: {:.2} seconds", duration_secs);
+
+        // Mark as ready after successfully opening the video
+        is_ready.store(true, Ordering::Relaxed);
 
         let video_stream_index = ictx
             .streams()
@@ -203,18 +262,36 @@ impl FfmpegPlayer {
 
         println!("[DEBUG] Starting packet loop, waiting for is_playing...");
         let mut frame_count = 0u64;
+        let mut prebuffering = true;
+        const PREBUFFER_FRAMES: usize = 30; // Prebuffer ~1 second of video
+        const PREBUFFER_AUDIO_SAMPLES: usize = 44100; // Prebuffer ~0.5 second of audio
+
         for (stream, packet) in ictx.packets() {
             if should_stop.load(Ordering::Relaxed) {
                 println!("[DEBUG] should_stop is true, breaking");
                 break;
             }
 
-            while !is_playing.load(Ordering::Relaxed) && !should_stop.load(Ordering::Relaxed) {
-                thread::sleep(std::time::Duration::from_millis(10));
+            // During prebuffering, decode without waiting for is_playing
+            if prebuffering {
+                let video_ready = frame_queue.lock().map(|f| f.len() >= PREBUFFER_FRAMES).unwrap_or(false);
+                let audio_ready = audio_buffer.lock().map(|b| b.samples.len() >= PREBUFFER_AUDIO_SAMPLES).unwrap_or(false);
+
+                if video_ready && audio_ready {
+                    println!("[DEBUG] Prebuffering complete, waiting for play signal");
+                    prebuffering = false;
+                }
             }
 
-            if frame_count == 0 {
-                println!("[DEBUG] is_playing became true, starting decode");
+            // Wait for play signal only after prebuffering is done
+            if !prebuffering {
+                while !is_playing.load(Ordering::Relaxed) && !should_stop.load(Ordering::Relaxed) {
+                    thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+
+            if frame_count == 0 && is_playing.load(Ordering::Relaxed) {
+                println!("[DEBUG] is_playing became true, starting playback");
             }
 
             if should_stop.load(Ordering::Relaxed) {
@@ -248,10 +325,12 @@ impl FfmpegPlayer {
                             scaler.run(&decoded, &mut rgb_frame)?;
 
                             let pts = decoded.pts().unwrap_or(0);
-                            let pts_us = if let Some(tb) = video_time_base {
-                                (pts as f64 * tb.numerator() as f64 / tb.denominator() as f64 * 1_000_000_000.0) as u64
+                            let (pts_us, pos_secs) = if let Some(tb) = video_time_base {
+                                let secs = pts as f64 * tb.numerator() as f64 / tb.denominator() as f64;
+                                let us = (secs * 1_000_000_000.0) as u64;
+                                (us, secs)
                             } else {
-                                pts as u64
+                                (pts as u64, 0.0)
                             };
 
                             // Handle stride/padding: copy only the actual pixel data
@@ -272,11 +351,21 @@ impl FfmpegPlayer {
                                 height: height as u32,
                                 data: pixel_data,
                                 pts: pts_us,
+                                position_secs: pos_secs,
                             };
 
-                            if let Ok(mut frames) = frame_queue.lock() {
-                                if frames.len() < 100 {
-                                    frames.push_back(video_info);
+                            // Wait if frame queue is full to maintain sync
+                            loop {
+                                if let Ok(mut frames) = frame_queue.lock() {
+                                    if frames.len() < 100 {
+                                        frames.push_back(video_info);
+                                        break;
+                                    }
+                                }
+                                // Queue full, wait a bit
+                                thread::sleep(std::time::Duration::from_millis(5));
+                                if should_stop.load(Ordering::Relaxed) {
+                                    break;
                                 }
                             }
                         }
@@ -300,23 +389,27 @@ impl FfmpegPlayer {
                         }
 
                         if let Some(ref mut resampler) = resampler {
-                            // Estimate output samples
-                            let in_samples = decoded.samples();
-                            let out_rate = 44100u64;
-                            let in_rate = decoded.rate() as u64;
-                            let estimated_out = ((in_samples as u64 * out_rate / in_rate) + 256) as usize;
+                            let mut resampled = ffmpeg::util::frame::audio::Audio::empty();
 
-                            let mut resampled = ffmpeg::util::frame::audio::Audio::new(
-                                ffmpeg::format::Sample::F32(ffmpeg::format::sample::Type::Packed),
-                                estimated_out,
-                                ffmpeg::channel_layout::ChannelLayout::STEREO,
-                            );
-
-                            if resampler.run(&decoded, &mut resampled).is_ok() {
+                            if resampler.run(&decoded, &mut resampled).is_ok() && resampled.samples() > 0 {
+                                // Get actual number of samples * channels (stereo = 2)
+                                let actual_samples = resampled.samples() * 2;
                                 let plane = resampled.plane::<f32>(0);
-                                if let Ok(mut buffer) = audio_buffer.lock() {
-                                    for &sample in plane {
-                                        buffer.samples.push_back(sample);
+
+                                // Wait if audio buffer is full to maintain sync
+                                const MAX_BUFFER_SIZE: usize = 44100 * 2 * 2;
+                                loop {
+                                    if let Ok(mut buffer) = audio_buffer.lock() {
+                                        if buffer.samples.len() < MAX_BUFFER_SIZE {
+                                            for i in 0..actual_samples.min(plane.len()) {
+                                                buffer.samples.push_back(plane[i]);
+                                            }
+                                            break;
+                                        }
+                                    }
+                                    thread::sleep(std::time::Duration::from_millis(5));
+                                    if should_stop.load(Ordering::Relaxed) {
+                                        break;
                                     }
                                 }
                             }
